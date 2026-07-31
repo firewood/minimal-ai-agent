@@ -1,4 +1,7 @@
 import { Agent } from "agents";
+import { generate } from "./gemini";
+// 行動空間の宣言（型とスキーマ）は actions.ts にまとめてある。
+import { ACTIONS_SCHEMA, type Action } from "./actions";
 
 // Cloudflare.Env は `wrangler types` が生成する（worker-configuration.d.ts）。
 // Durable Object のバインディングはそこで型付け済みなので、ここではシークレットだけ足す。
@@ -29,6 +32,23 @@ export type AssistantState = {
   // 自発的に投稿するときにも使う。
   slackChannelId?: string;
 };
+
+const SYSTEM_PROMPT = `あなたは個人アシスタント（秘書）Agent です。
+毎回のプロンプトには「未完了タスク」のコンテキストが与えられます。
+これらを踏まえ、次に取るべきアクションを JSON で返します。
+
+# アクションの使い分け
+- 質問への回答や情報提供は reply。コンテキストの台帳を根拠に具体的に答える。
+  ユーザーの発言をそのまま繰り返さない。付け加えることが無いなら、次の一歩を短く示す。
+- ユーザーに確認・判断を求める問いかけは ask_user。
+- create_task はユーザーが明示的に依頼したときだけ使う。推測でタスク化しない。
+  実行前に承認が要るものは requires_user_approval=true にする。
+- カレンダーに予定を追加すべきときは create_event（title と start[ISO8601] は必須）。
+  実世界に作用するため必ず承認を挟む。曖昧なら ask_user で確認する。
+- すでに台帳にあるものを重複して作らない。
+- 何もする必要がなければ actions は空配列にする（無意味な発信をしない）。
+
+日本語で簡潔に。`;
 
 /**
  * 個人アシスタント Agent。
@@ -154,5 +174,28 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
       WHERE status IN ('open', 'waiting_user', 'approved', 'executing')
       ORDER BY updated_at DESC LIMIT 30
     `;
+  }
+
+  // ---- LLM への問い合わせ ----
+
+  /**
+   * LLM に「次に取るべきアクション」を決めさせる。
+   *
+   * 返るのは必ず Action[]。LLM が落ちても Agent 全体は生き続けるべきなので、
+   * 失敗しても例外を投げず空配列にする（CONCEPT.md 原則 4「安全側に倒す」）。
+   */
+  async askLlm(prompt: string): Promise<Action[]> {
+    try {
+      const result = await generate<{ actions: Action[] }>({
+        apiKey: this.env.GEMINI_API_KEY,
+        systemInstruction: SYSTEM_PROMPT,
+        prompt,
+        schema: ACTIONS_SCHEMA,
+      });
+      return result.actions ?? [];
+    } catch (err) {
+      console.error("LLM call failed:", err);
+      return [];
+    }
   }
 }
