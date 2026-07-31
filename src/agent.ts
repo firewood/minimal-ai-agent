@@ -212,8 +212,62 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
       this.setState({ ...this.state, slackChannelId: channel });
     }
 
-    // TODO: LLM の応答をここに書く
+    const text: string = event.text ?? "";
+    // スレッド内の発言なら thread_ts が入る。返信も同じスレッドに返す。
+    const threadTs: string | undefined = event.thread_ts;
+
+    const actions = await this.askLlmForSlackReply(text);
+    await this.applyActions(actions, { threadTs });
     return { ok: true };
+  }
+
+  // ---- applyActions: LLM の出力を副作用に変える翻訳層 ----
+
+  /**
+   * エージェントの心臓部。
+   *
+   * LLM が返したアクションを、実際の副作用（DB 書き込み・Slack 投稿）に変換する。
+   * Slack 経由でも heartbeat 経由でも、あらゆる経路が最終的にここに集約される。
+   * 「副作用が起きる場所」を一箇所に絞ることで、システムの振る舞いが追えるようになる。
+   *
+   * LLM はここに書かれていないことは何もできない。
+   */
+  async applyActions(actions: Action[], opts: { threadTs?: string } = {}) {
+    for (const action of actions) {
+      if (action.type === "reply" || action.type === "ask_user") {
+        await this.postSlackMessage(action.message, opts.threadTs);
+      }
+
+      if (action.type === "create_task") {
+        const taskId = this.createTask(action.title, {
+          // 承認が要るタスクは open ではなく waiting_user から始める。
+          status: action.requires_user_approval ? "waiting_user" : "open",
+          priority: action.priority,
+          dueAt: action.due_at,
+          payload: action,
+        });
+        await this.postSlackMessage(`📝 タスクを登録しました: ${action.title}`, opts.threadTs);
+        // TODO: あとで承認ボタンを実装
+        void taskId;
+      }
+
+      // create_event（外部作用）の扱いはまだない。
+    }
+  }
+
+  // ---- LLM に渡すコンテキスト ----
+
+  /**
+   * すべての LLM 呼び出しに前置きする共通コンテキスト。
+   *
+   * 経路（Slack 応答 / heartbeat）ごとに見える情報が違うと、
+   * 「さっき言ったことを heartbeat が知らない」型の不整合が生まれる。
+   * 視界を 1 つの関数に一元化しておくのが要点。
+   */
+  protected async buildAssistantContext(): Promise<string> {
+    const tasks = this.openTasks();
+    return `# 未完了タスク
+${JSON.stringify(tasks)}`;
   }
 
   // ---- Slack への投稿 ----
@@ -244,18 +298,33 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
 
   // ---- LLM への問い合わせ ----
 
+  /** フロー A: Slack のメッセージへの応答アクションを決めさせる。 */
+  async askLlmForSlackReply(text: string): Promise<Action[]> {
+    return this.askLlm(`Slack でユーザーから次のメッセージが来ました。
+コンテキスト（タスク台帳）を踏まえて応答アクションを決めてください。
+質問への回答や情報提供は reply を使い、台帳を根拠に具体的に答えてください。
+
+# メッセージ
+${text}
+
+# 自律レベル
+${this.state.autonomyLevel}`);
+  }
+
   /**
    * LLM に「次に取るべきアクション」を決めさせる。
+   * 共通コンテキストを前置きしてから問いを渡す。
    *
    * 返るのは必ず Action[]。LLM が落ちても Agent 全体は生き続けるべきなので、
    * 失敗しても例外を投げず空配列にする（CONCEPT.md 原則 4「安全側に倒す」）。
    */
   async askLlm(prompt: string): Promise<Action[]> {
+    const full = `${await this.buildAssistantContext()}\n\n---\n\n${prompt}`;
     try {
       const result = await generate<{ actions: Action[] }>({
         apiKey: this.env.GEMINI_API_KEY,
         systemInstruction: SYSTEM_PROMPT,
-        prompt,
+        prompt: full,
         schema: ACTIONS_SCHEMA,
       });
       return result.actions ?? [];
