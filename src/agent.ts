@@ -176,6 +176,72 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     `;
   }
 
+  // ---- フロー A: Slack から話しかけられたとき ----
+
+  /**
+   * Slack Events API の payload を処理する（Worker で署名検証済み）。
+   * ここが「誰の言うことを聞くか」を決める場所でもある。
+   */
+  async handleSlackEvent(payload: any) {
+    const event = payload.event;
+    if (!event) return { ok: true };
+
+    // Bot 自身の投稿・メッセージ編集などは無視する。
+    // これを忘れると、自分の投稿に自分が反応して無限ループする。
+    if (event.bot_id || event.subtype) return { ok: true };
+
+    const user: string | undefined = event.user;
+    const channel: string | undefined = event.channel;
+
+    // 初回ブートストラップ: slackUserId が未設定（プレースホルダ）なら、
+    // 最初に話しかけてきたユーザーを所有者として学習する。
+    if (this.state.slackUserId === "UXXXXXXXX" && user) {
+      this.setState({ ...this.state, slackUserId: user });
+      console.log(`bootstrapped owner slackUserId = ${user}`);
+    }
+
+    // 所有者以外は拒否（allowlist）。チャンネルの他メンバーの発言はここで弾かれる。
+    // 「所有者しか使えない」を既定にする（CONCEPT.md 原則 4「安全側に倒す」）。
+    if (user && user !== this.state.slackUserId) {
+      return { ok: false, reason: "user not allowed" };
+    }
+
+    // 話しかけられたチャンネルを返信先として覚える。
+    // これを state に持つことで、heartbeat から自発的に投稿できるようになる。
+    if (channel && channel !== this.state.slackChannelId) {
+      this.setState({ ...this.state, slackChannelId: channel });
+    }
+
+    // TODO: LLM の応答をここに書く
+    return { ok: true };
+  }
+
+  // ---- Slack への投稿 ----
+
+  async postSlackMessage(text: string, threadTs?: string) {
+    await this.slackPost({ text, ...(threadTs ? { thread_ts: threadTs } : {}) });
+  }
+
+  protected async slackPost(body: Record<string, unknown>) {
+    if (!this.state.slackChannelId) {
+      console.warn("slackPost skipped: slackChannelId is not set yet");
+      return;
+    }
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.env.SLACK_BOT_TOKEN}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({ channel: this.state.slackChannelId, ...body }),
+    });
+    // Slack は HTTP 200 でも { ok: false, error } を返すことがある。
+    const data = (await res.json()) as { ok: boolean; error?: string };
+    if (!data.ok) {
+      console.error(`Slack postMessage failed: ${data.error}`);
+    }
+  }
+
   // ---- LLM への問い合わせ ----
 
   /**
