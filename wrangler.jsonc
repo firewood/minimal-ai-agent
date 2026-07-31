@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "minimal-ai-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  // Agents SDK の Agent は SQLite-backed Durable Object 上で動く。
+  // 1 ユーザー = 1 instance（名前 "ai-agent"）で運用する（詳細は CONCEPT.md 原則 1）。
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PersonalAssistantAgent",
+        "class_name": "PersonalAssistantAgent"
+      }
+    ]
+  },
+  // new_sqlite_classes にすると、この DO が this.sql（ローカル SQLite）を使えるようになる。
+  // これが Task Ledger の実体になる。
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PersonalAssistantAgent"]
+    }
+  ]
+  // シークレットは .dev.vars（ローカル）と `wrangler secret put`（本番）で設定する。
+  // コードにもこのファイルにも書かない。
+}

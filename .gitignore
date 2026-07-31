@@ -1,0 +1,8 @@
+node_modules/
+.dev.vars
+.wrangler/
+dist/
+# `wrangler types` が生成する型定義（500KB超）。clone 後に自分で生成する。
+worker-configuration.d.ts
+*.log
+.DS_Store

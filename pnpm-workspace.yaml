@@ -1,0 +1,16 @@
+# 公開直後のバージョンは入れない（サプライチェーン対策）。単位は分で 10080 = 7 日。
+# npm パッケージの乗っ取りは公開直後に発覚して撤回されることが多いので、
+# 隔離期間を置くだけで大半を避けられる。pnpm 11 の既定は 1440（1 日）。
+minimumReleaseAge: 10080
+
+# どの依存に postinstall（ビルドスクリプト）の実行を許すか。pnpm 11 は未判断のものが
+# あると install を失敗させる（ERR_PNPM_IGNORED_BUILDS）ため、明示的に true/false を書く。
+allowBuilds:
+  # Cloudflare ランタイム本体。wrangler dev / deploy が使うバイナリを配置する。
+  workerd: true
+  # wrangler のバンドラ。プラットフォーム別バイナリの検証・リンクを行う。
+  esbuild: true
+  # wrangler → miniflare 経由の画像処理ライブラリ。この repo では使わない。
+  sharp: false
+  # agents → mimetext → @babel/runtime-corejs3 経由の polyfill。ビルド不要。
+  core-js-pure: false

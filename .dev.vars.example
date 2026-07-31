@@ -1,0 +1,11 @@
+# ローカル開発用シークレット。`.dev.vars` にコピーして値を入れる。
+# 本番は `wrangler secret put <NAME>` で設定する（このファイルはデプロイされない）。
+
+GEMINI_API_KEY=""
+SLACK_BOT_TOKEN=""
+SLACK_SIGNING_SECRET=""
+
+# Google Calendar（サービスアカウント方式）
+GOOGLE_SERVICE_ACCOUNT_EMAIL=""
+GOOGLE_PRIVATE_KEY=""
+GOOGLE_CALENDAR_ID=""
