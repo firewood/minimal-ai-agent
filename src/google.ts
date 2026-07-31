@@ -157,3 +157,58 @@ export async function listUpcomingEvents(
     location: e.location,
   }));
 }
+
+/**
+ * カレンダーに予定を 1 件作成する。
+ *
+ * これがこのシステム唯一の「実世界に作用する」操作。
+ * そのため承認済みタスクの実行経路からしか呼ばれない（agent.ts の executeTask）。
+ * end を省略した場合は start の 1 時間後にする。
+ */
+export async function insertEvent(
+  env: GoogleEnv,
+  ev: { summary: string; start: string; end?: string; location?: string; timezone?: string },
+): Promise<CalendarEvent> {
+  const token = await getAccessToken(env);
+  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID);
+
+  // LLM が生成した日時をそのまま Google に投げない。ここで一度検証する。
+  const startMs = Date.parse(ev.start);
+  if (Number.isNaN(startMs)) {
+    throw new Error(`insertEvent: invalid start "${ev.start}"`);
+  }
+  const end = ev.end ?? new Date(startMs + 60 * 60 * 1000).toISOString();
+
+  const url = `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      summary: ev.summary,
+      location: ev.location,
+      start: { dateTime: ev.start, timeZone: ev.timezone },
+      end: { dateTime: end, timeZone: ev.timezone },
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Calendar insert error ${res.status}: ${await res.text()}`);
+  }
+
+  const e = (await res.json()) as {
+    id: string;
+    summary?: string;
+    location?: string;
+    start?: { dateTime?: string; date?: string };
+    end?: { dateTime?: string; date?: string };
+  };
+  return {
+    id: e.id,
+    summary: e.summary ?? ev.summary,
+    start: e.start?.dateTime ?? e.start?.date,
+    end: e.end?.dateTime ?? e.end?.date,
+    location: e.location,
+  };
+}

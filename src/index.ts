@@ -44,6 +44,30 @@ export default {
       return Response.json({ ok: true });
     }
 
+    // --- Slack Interactivity: ボタン押下（承認/却下）---
+    if (url.pathname === "/slack/interactivity" && request.method === "POST") {
+      const verified = await verifySlackRequest(request, env.SLACK_SIGNING_SECRET);
+      if (!verified.ok) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      // interactivity の body は application/x-www-form-urlencoded で payload=<JSON>。
+      // events とは形式が違うので注意。
+      const params = new URLSearchParams(verified.body);
+      const raw = params.get("payload");
+      if (!raw) return new Response("Bad Request", { status: 400 });
+      const payload = JSON.parse(raw);
+
+      const agent = await getAgentByName<Env, PersonalAssistantAgent>(
+        env.PersonalAssistantAgent,
+        AGENT_NAME,
+      );
+      // 即 200（空ボディ）。Slack はこれで元メッセージを変えない。
+      // 元メッセージの差し替えは Agent 側が response_url で行う。
+      ctx.waitUntil(agent.handleSlackInteraction(payload));
+      return new Response("", { status: 200 });
+    }
+
     // --- それ以外は Agents SDK のルーティングへ ---
     return (
       (await routeAgentRequest(request, env)) ||

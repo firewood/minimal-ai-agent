@@ -2,7 +2,7 @@ import { Agent } from "agents";
 import { generate } from "./gemini";
 // 行動空間の宣言（型とスキーマ）は actions.ts にまとめてある。
 import { ACTIONS_SCHEMA, type Action } from "./actions";
-import { listUpcomingEvents, type CalendarEvent } from "./google";
+import { listUpcomingEvents, insertEvent, type CalendarEvent } from "./google";
 
 // Cloudflare.Env は `wrangler types` が生成する（worker-configuration.d.ts）。
 // Durable Object のバインディングはそこで型付け済みなので、ここではシークレットだけ足す。
@@ -107,6 +107,16 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
         task_id TEXT,
         type TEXT,
         message TEXT,
+        created_at TEXT NOT NULL
+      )
+    `;
+    // ユーザーの承認/却下の記録。人間がどこで介入したかの台帳。
+    // 却下も記録する。
+    this.sql`
+      CREATE TABLE IF NOT EXISTS user_decisions (
+        decision_id TEXT PRIMARY KEY,
+        task_id TEXT,
+        decision TEXT,
         created_at TEXT NOT NULL
       )
     `;
@@ -293,12 +303,160 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
           dueAt: action.due_at,
           payload: action,
         });
-        await this.postSlackMessage(`📝 タスクを登録しました: ${action.title}`, opts.threadTs);
-        // TODO: あとで承認ボタンを実装
-        void taskId;
+        if (action.requires_user_approval) {
+          await this.postApprovalRequest(taskId, action.title, opts.threadTs);
+        } else {
+          await this.postSlackMessage(`📝 タスクを登録しました: ${action.title}`, opts.threadTs);
+        }
       }
 
-      // create_event（外部作用）の扱いはまだない。
+      if (action.type === "create_event") {
+        // 外部作用アクション。LLM がどれだけ確信していても即実行しない。
+        // waiting_user のタスクとして台帳に保存し、承認ボタンを出す。
+        // payload_json にアクション全体を入れておき、承認時に実行内容を復元する。
+        const taskId = this.createTask(action.title, {
+          status: "waiting_user",
+          dueAt: action.start,
+          payload: action,
+        });
+        await this.postApprovalRequest(
+          taskId,
+          `📅 予定を追加: ${action.title}（${action.start}）`,
+          opts.threadTs,
+        );
+      }
+    }
+  }
+
+  // ---- フロー C: 承認ボタン（human-in-the-loop） ----
+
+  /** 承認/却下ボタン付きメッセージ（Block Kit）を投稿する。 */
+  async postApprovalRequest(taskId: string, title: string, threadTs?: string) {
+    await this.slackPost({
+      // blocks を出す場合も text は入れる（通知プレビュー・アクセシビリティ用）。
+      text: `承認依頼: ${title}`,
+      ...(threadTs ? { thread_ts: threadTs } : {}),
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: `*承認依頼*\n${title}` },
+        },
+        {
+          type: "actions",
+          block_id: `approval:${taskId}`,
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "承認" },
+              style: "primary",
+              action_id: "approve",
+              // どのタスクへの承認かを value に載せて往復させる。
+              value: taskId,
+            },
+            {
+              type: "button",
+              text: { type: "plain_text", text: "却下" },
+              style: "danger",
+              action_id: "reject",
+              value: taskId,
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  /**
+   * Slack のボタン押下（block_actions）を処理する。Worker で署名検証済み。
+   * ここでタスクの状態機械が waiting_user から先へ進む。
+   */
+  async handleSlackInteraction(payload: any) {
+    // 所有者以外の操作は拒否（allowlist はボタンにも効かせる）。
+    if (payload.user?.id && payload.user.id !== this.state.slackUserId) {
+      return { ok: false, reason: "user not allowed" };
+    }
+    const action = payload.actions?.[0];
+    if (!action) return { ok: true };
+    if (action.action_id !== "approve" && action.action_id !== "reject") {
+      return { ok: true };
+    }
+
+    const taskId: string = action.value;
+    const decision = action.action_id as "approve" | "reject";
+    const now = new Date().toISOString();
+
+    this.markTaskStatus(taskId, decision === "approve" ? "approved" : "rejected");
+    // 却下も記録する。今後機能拡張する場合、学習材料になりうる。
+    this.sql`
+      INSERT INTO user_decisions (decision_id, task_id, decision, created_at)
+      VALUES (${crypto.randomUUID()}, ${taskId}, ${decision}, ${now})
+    `;
+
+    const title =
+      this.sql<{ title: string }>`SELECT title FROM tasks WHERE task_id = ${taskId}`[0]?.title ??
+      taskId;
+    const label = decision === "approve" ? "✅ 承認しました" : "🚫 却下しました";
+
+    // 元の承認依頼メッセージを結果テキストに置き換える。
+    // ボタンを残したままにすると二度押しできてしまう。
+    if (payload.response_url) {
+      await fetch(payload.response_url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ replace_original: true, text: `${label}: ${title}` }),
+      });
+    }
+
+    // 承認されて初めて、保存しておいた副作用を実行する。
+    if (decision === "approve") {
+      await this.executeTask(taskId);
+    }
+    return { ok: true };
+  }
+
+  /**
+   * 承認済みタスクの副作用を実際に実行する（approved → executing → done/error）。
+   *
+   * 実行対象は payload_json に保存しておいたアクション。
+   * LLM はこの経路に一切関与しない。決定的なコードだけが実世界に触れる。
+   */
+  async executeTask(taskId: string) {
+    const row = this.sql<{ payload_json: string | null; title: string }>`
+      SELECT payload_json, title FROM tasks WHERE task_id = ${taskId}
+    `[0];
+    if (!row) return;
+
+    let action: Action | null = null;
+    try {
+      action = row.payload_json ? (JSON.parse(row.payload_json) as Action) : null;
+    } catch {
+      action = null;
+    }
+    // 外部作用を持つのは create_event だけ。外部作用がないものは approved のまま残る。
+    if (!action || action.type !== "create_event") return;
+
+    if (!this.env.GOOGLE_PRIVATE_KEY || !this.env.GOOGLE_CALENDAR_ID) {
+      this.markTaskStatus(taskId, "error");
+      await this.postSlackMessage(`⚠️ カレンダー未設定のため予定を追加できません: ${row.title}`);
+      return;
+    }
+
+    this.markTaskStatus(taskId, "executing");
+    try {
+      const ev = await insertEvent(this.env, {
+        summary: action.title,
+        start: action.start,
+        end: action.end ?? undefined,
+        location: action.location,
+        timezone: this.state.timezone,
+      });
+      this.markTaskStatus(taskId, "done");
+      await this.postSlackMessage(`📅 カレンダーに追加しました: ${ev.summary}（${ev.start}）`);
+    } catch (err) {
+      console.error("executeTask failed:", err);
+      // 失敗を握り潰さない。done でも waiting_user でもない error という行き先を用意する。
+      this.markTaskStatus(taskId, "error");
+      await this.postSlackMessage(`⚠️ 予定の追加に失敗しました: ${row.title}`);
     }
   }
 
