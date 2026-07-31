@@ -2,6 +2,7 @@ import { Agent } from "agents";
 import { generate } from "./gemini";
 // 行動空間の宣言（型とスキーマ）は actions.ts にまとめてある。
 import { ACTIONS_SCHEMA, type Action } from "./actions";
+import { listUpcomingEvents, type CalendarEvent } from "./google";
 
 // Cloudflare.Env は `wrangler types` が生成する（worker-configuration.d.ts）。
 // Durable Object のバインディングはそこで型付け済みなので、ここではシークレットだけ足す。
@@ -39,11 +40,11 @@ export type AssistantState = {
 const HEARTBEAT_INTERVAL_MIN = 120;
 
 const SYSTEM_PROMPT = `あなたは個人アシスタント（秘書）Agent です。
-毎回のプロンプトには「未完了タスク」のコンテキストが与えられます。
+毎回のプロンプトには「未完了タスク・カレンダー予定」のコンテキストが与えられます。
 これらを踏まえ、次に取るべきアクションを JSON で返します。
 
 # アクションの使い分け
-- 質問への回答や情報提供は reply。コンテキストの台帳を根拠に具体的に答える。
+- 質問への回答や情報提供は reply。コンテキストの台帳・予定を根拠に具体的に答える。
   ユーザーの発言をそのまま繰り返さない。付け加えることが無いなら、次の一歩を短く示す。
 - ユーザーに確認・判断を求める問いかけは ask_user。
 - create_task はユーザーが明示的に依頼したときだけ使う。推測でタスク化しない。
@@ -123,7 +124,7 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
 
   /**
    * schedule() のコールバック。一定間隔で自分で目を覚まし、
-   * 台帳を見て「いま伝える価値のあること」があるかを判断する。
+   * 台帳と予定を見て「いま伝える価値のあること」があるかを判断する。
    *
    * cron 用の別 Worker は要らない。Agent 自身が目覚まし時計を持っている。
    */
@@ -312,8 +313,28 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
    */
   protected async buildAssistantContext(): Promise<string> {
     const tasks = this.openTasks();
+    const calendarEvents = await this.fetchUpcomingCalendarEvents();
     return `# 未完了タスク
-${JSON.stringify(tasks)}`;
+${JSON.stringify(tasks)}
+
+# 今後のカレンダー予定
+${JSON.stringify(calendarEvents)}`;
+  }
+
+  /**
+   * 直近の予定を取得する。未設定・失敗時は空配列に落とす。
+   * カレンダーが落ちても Agent は返事ができるべき（CONCEPT.md 原則 4「安全側に倒す」）。
+   */
+  async fetchUpcomingCalendarEvents(): Promise<CalendarEvent[]> {
+    if (!this.env.GOOGLE_PRIVATE_KEY || !this.env.GOOGLE_CALENDAR_ID) {
+      return []; // 未設定なら Calendar 連携オフ
+    }
+    try {
+      return await listUpcomingEvents(this.env, { maxResults: 10 });
+    } catch (err) {
+      console.error("Calendar fetch failed:", err);
+      return [];
+    }
   }
 
   // ---- Slack への投稿 ----
@@ -347,7 +368,7 @@ ${JSON.stringify(tasks)}`;
   /** フロー B: 定期チェックで「いま何かすべきか」を決めさせる。 */
   async askLlmForPlan(): Promise<Action[]> {
     return this.askLlm(`定期チェック（heartbeat）です。
-コンテキストのタスク台帳を見直し、今本当に必要なアクションだけを返してください。
+コンテキストのタスク台帳・カレンダー予定を見直し、今本当に必要なアクションだけを返してください。
 - 期限が近い/過ぎたタスクなど、価値のある注意喚起だけを行う
 - 特に伝えるべきことがなければ actions は空配列にする（無意味な発信をしない）
 
@@ -358,8 +379,8 @@ ${this.state.autonomyLevel}`);
   /** フロー A: Slack のメッセージへの応答アクションを決めさせる。 */
   async askLlmForSlackReply(text: string): Promise<Action[]> {
     return this.askLlm(`Slack でユーザーから次のメッセージが来ました。
-コンテキスト（タスク台帳）を踏まえて応答アクションを決めてください。
-質問への回答や情報提供は reply を使い、台帳を根拠に具体的に答えてください。
+コンテキスト（タスク台帳・予定）を踏まえて応答アクションを決めてください。
+質問への回答や情報提供は reply を使い、台帳や予定を根拠に具体的に答えてください。
 
 # メッセージ
 ${text}
