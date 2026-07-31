@@ -47,4 +47,112 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     timezone: "Asia/Tokyo",
     slackUserId: "UXXXXXXXX",
   };
+
+  /**
+   * Agent インスタンスの起動時に毎回呼ばれる（コードやシークレットを更新して
+   * Durable Object が作り直されるたびに走る）。そのため冪等でなければならない。
+   */
+  async onStart() {
+    // 状態の第 2 層 = Task Ledger（タスク台帳）。
+    // 中央 DB（D1）は置かず、Agent ローカルの SQLite が台帳そのもの（CONCEPT.md 原則 1「1 ユーザー = 1 Agent」）。
+    //
+    // status がタスクの状態機械そのものになる:
+    //   open → waiting_user → approved → executing → done / error / rejected
+    // payload_json には「承認されたら何を実行するか」を丸ごと保存しておく。
+    this.sql`
+      CREATE TABLE IF NOT EXISTS tasks (
+        task_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        priority TEXT,
+        source TEXT,
+        autonomy_level TEXT,
+        due_at TEXT,
+        payload_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `;
+    // タスクに起きたことの履歴。tasks は現在の状態しか持たないので、
+    // 「いつ完了したか」のような時系列はこちらに追記する。
+    this.sql`
+      CREATE TABLE IF NOT EXISTS task_events (
+        event_id TEXT PRIMARY KEY,
+        task_id TEXT,
+        type TEXT,
+        message TEXT,
+        created_at TEXT NOT NULL
+      )
+    `;
+  }
+
+  // ---- Task Ledger の操作 ----
+
+  /** タスクを 1 件登録し、その task_id を返す。 */
+  createTask(
+    title: string,
+    opts: {
+      status?: string;
+      priority?: string;
+      source?: string;
+      dueAt?: string | null;
+      payload?: unknown;
+    } = {},
+  ): string {
+    const now = new Date().toISOString();
+    const taskId = crypto.randomUUID();
+    this.sql`
+      INSERT INTO tasks (
+        task_id, title, status, priority, source,
+        autonomy_level, due_at, payload_json, created_at, updated_at
+      ) VALUES (
+        ${taskId},
+        ${title},
+        ${opts.status ?? "open"},
+        ${opts.priority ?? "medium"},
+        ${opts.source ?? "llm"},
+        ${this.state.autonomyLevel},
+        ${opts.dueAt ?? null},
+        ${opts.payload ? JSON.stringify(opts.payload) : null},
+        ${now},
+        ${now}
+      )
+    `;
+    return taskId;
+  }
+
+  /** タスクの状態を遷移させる。完了は履歴にも 1 件だけ残す。 */
+  markTaskStatus(taskId: string, status: string) {
+    const now = new Date().toISOString();
+    this.sql`
+      UPDATE tasks SET status = ${status}, updated_at = ${now} WHERE task_id = ${taskId}
+    `;
+    if (status === "done") this.recordTaskCompletion(taskId);
+  }
+
+  /** 完了を task_events に 1 件だけ記録する（何度 done にしても増えない）。 */
+  private recordTaskCompletion(taskId: string) {
+    const existing = this.sql`
+      SELECT 1 FROM task_events WHERE task_id = ${taskId} AND type = 'completed' LIMIT 1
+    `;
+    if (existing.length > 0) return;
+    const title = this.sql<{ title: string }>`
+      SELECT title FROM tasks WHERE task_id = ${taskId}
+    `[0]?.title;
+    if (!title) return;
+    this.sql`
+      INSERT INTO task_events (event_id, task_id, type, message, created_at)
+      VALUES (${crypto.randomUUID()}, ${taskId}, ${"completed"}, ${title}, ${new Date().toISOString()})
+    `;
+  }
+
+  /** 未完了タスク（＝Agent が気にかけ続けるべきもの）。 */
+  openTasks() {
+    return this.sql`
+      SELECT task_id, title, status, priority, due_at
+      FROM tasks
+      WHERE status IN ('open', 'waiting_user', 'approved', 'executing')
+      ORDER BY updated_at DESC LIMIT 30
+    `;
+  }
 }
