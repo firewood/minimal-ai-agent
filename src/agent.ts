@@ -33,6 +33,11 @@ export type AssistantState = {
   slackChannelId?: string;
 };
 
+// 自律チェック（heartbeat）の間隔。
+// 発信が多すぎると通知そのものが無視されるようになるので、間隔は控えめに 2 時間にしてある。
+// 「設定ミスで連投・課金・枠の枯渇が起きる方向には倒さない」（CONCEPT.md 原則 4「安全側に倒す」）。
+const HEARTBEAT_INTERVAL_MIN = 120;
+
 const SYSTEM_PROMPT = `あなたは個人アシスタント（秘書）Agent です。
 毎回のプロンプトには「未完了タスク」のコンテキストが与えられます。
 これらを踏まえ、次に取るべきアクションを JSON で返します。
@@ -104,6 +109,47 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
         created_at TEXT NOT NULL
       )
     `;
+
+    // heartbeat を 1 回だけ登録する（重複登録を防ぐ）。
+    // onStart はコード/シークレット更新で DO が作り直されるたびに走るので、
+    // 「もう登録済みか」を必ず確認してから予約する。
+    const hasHeartbeat = this.getSchedules().some((s) => s.payload === "heartbeat");
+    if (!hasHeartbeat) {
+      await this.rescheduleHeartbeat();
+    }
+  }
+
+  // ---- フロー B: heartbeat（自律ループ） ----
+
+  /**
+   * schedule() のコールバック。一定間隔で自分で目を覚まし、
+   * 台帳を見て「いま伝える価値のあること」があるかを判断する。
+   *
+   * cron 用の別 Worker は要らない。Agent 自身が目覚まし時計を持っている。
+   */
+  async heartbeat() {
+    try {
+      const actions = await this.askLlmForPlan();
+      await this.applyActions(actions);
+    } finally {
+      // 途中で失敗しても次回を必ず登録する。
+      // ここを try の中に置くと、1 回の失敗で heartbeat の鎖が切れて Agent が永久に眠る。
+      await this.rescheduleHeartbeat();
+    }
+  }
+
+  /** 既存の heartbeat 予約を消して、次回を登録し直す。 */
+  private async rescheduleHeartbeat(): Promise<Date> {
+    for (const s of this.getSchedules()) {
+      if (s.payload === "heartbeat") await this.cancelSchedule(s.id);
+    }
+    const at = new Date(Date.now() + HEARTBEAT_INTERVAL_MIN * 60 * 1000);
+    // idempotent: false は明示的な選択。true にすると「同じ callback+payload の既存行が
+    // あればその行（＝古い時刻）を返す」ため、cancel を取りこぼしたときに
+    // 古い予約に張り付いたまま、それが実行されて予約ゼロ＝heartbeat 停止になりうる。
+    // false なら最悪でも重複行が増えるだけで、次の再登録が全部消して直す。
+    await this.schedule(at, "heartbeat", "heartbeat", { idempotent: false });
+    return at;
   }
 
   // ---- Task Ledger の操作 ----
@@ -297,6 +343,17 @@ ${JSON.stringify(tasks)}`;
   }
 
   // ---- LLM への問い合わせ ----
+
+  /** フロー B: 定期チェックで「いま何かすべきか」を決めさせる。 */
+  async askLlmForPlan(): Promise<Action[]> {
+    return this.askLlm(`定期チェック（heartbeat）です。
+コンテキストのタスク台帳を見直し、今本当に必要なアクションだけを返してください。
+- 期限が近い/過ぎたタスクなど、価値のある注意喚起だけを行う
+- 特に伝えるべきことがなければ actions は空配列にする（無意味な発信をしない）
+
+# 自律レベル
+${this.state.autonomyLevel}`);
+  }
 
   /** フロー A: Slack のメッセージへの応答アクションを決めさせる。 */
   async askLlmForSlackReply(text: string): Promise<Action[]> {
