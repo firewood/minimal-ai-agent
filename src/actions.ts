@@ -9,7 +9,7 @@
 import type { LlmResponseSchema } from "./llm";
 
 /**
- * Agent の行動空間。LLM が取れる行動はこの 4 つだけ（CONCEPT.md 原則 2「LLM は頭脳、コードは手足」）。
+ * Agent の行動空間。LLM が取れる行動はこの 5 つだけ（CONCEPT.md 原則 2「LLM は頭脳、コードは手足」）。
  *
  * 能力を足すというのは、この型と ACTIONS_SCHEMA、そしてそれを実行するコードを
  * 増やすことであって、LLM に「もっと自由にやっていい」と言うことではない。
@@ -35,7 +35,10 @@ export type Action =
       start: string;
       end?: string | null;
       location?: string;
-    };
+    }
+  // show_task: 既存タスクをチェックボックス付きで Slack に再掲する。
+  // 「押しても何も進まない通知」ではなく、その場で完了にできる形で出すためのアクション。
+  | { type: "show_task"; task_id: string };
 
 /**
  * LLM に返させる structured output のスキーマ。
@@ -58,12 +61,18 @@ export const ACTIONS_SCHEMA: LlmResponseSchema = {
         properties: {
           type: {
             type: "string",
-            enum: ["reply", "ask_user", "create_task", "create_event"],
+            enum: ["reply", "ask_user", "create_task", "create_event", "show_task"],
             description:
               "reply=質問への回答・情報提供 / ask_user=Slackで確認・問いかけ / " +
-              "create_task=タスク登録 / create_event=カレンダーに予定作成（要承認）",
+              "create_task=タスク登録 / create_event=カレンダーに予定作成（要承認） / " +
+              "show_task=既存タスクをチェックボックスで再掲（着手・進捗の促し）",
           },
           message: { type: "string", description: "reply・ask_user の本文" },
+          task_id: {
+            type: "string",
+            description:
+              "show_task の対象タスクID（コンテキストの『未完了タスク』の task_id をそのまま使う）",
+          },
           title: {
             type: "string",
             description: "create_task のタスク名 / create_event の予定名",

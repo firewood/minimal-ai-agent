@@ -51,6 +51,9 @@ const SYSTEM_PROMPT = `あなたは個人アシスタント（秘書）Agent で
   実行前に承認が要るものは requires_user_approval=true にする。
 - カレンダーに予定を追加すべきときは create_event（title と start[ISO8601] は必須）。
   実世界に作用するため必ず承認を挟む。曖昧なら ask_user で確認する。
+- 既存タスクへの注意喚起・着手の促し・進捗確認には必ず show_task を添える。
+  task_id はコンテキストの「未完了タスク」からそのまま取る。
+  言葉で促すだけにせず、その場でチェックして完了にできる形で出すこと。
 - すでに台帳にあるものを重複して作らない。
 - 何もする必要がなければ actions は空配列にする（無意味な発信をしない）。
 
@@ -223,6 +226,23 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     `;
   }
 
+  /**
+   * task_id でタスクを引く。見つからなければ題名の部分一致で救済する。
+   * LLM が id を取り違えることがあるので、素直に諦めない方が体験が良い。
+   */
+  private findTask(taskIdOrTitle: string) {
+    const byId = this.sql<{ task_id: string; title: string; status: string }>`
+      SELECT task_id, title, status FROM tasks WHERE task_id = ${taskIdOrTitle}
+    `;
+    if (byId[0]) return byId[0];
+    return this.sql<{ task_id: string; title: string; status: string }>`
+      SELECT task_id, title, status FROM tasks
+      WHERE title LIKE ${"%" + taskIdOrTitle + "%"}
+        AND status NOT IN ('done', 'rejected')
+      ORDER BY updated_at DESC LIMIT 1
+    `[0];
+  }
+
   /** 未完了タスク（＝Agent が気にかけ続けるべきもの）。 */
   openTasks() {
     return this.sql`
@@ -306,7 +326,17 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
         if (action.requires_user_approval) {
           await this.postApprovalRequest(taskId, action.title, opts.threadTs);
         } else {
-          await this.postSlackMessage(`📝 タスクを登録しました: ${action.title}`, opts.threadTs);
+          // 平文で「登録しました」と言うのではなく、その場で完了にできる形で出す。
+          await this.postTask(taskId, action.title, false, opts.threadTs);
+        }
+      }
+
+      if (action.type === "show_task") {
+        const task = this.findTask(action.task_id);
+        if (!task) {
+          await this.postSlackMessage("⚠️ 対象のタスクが見つかりませんでした。", opts.threadTs);
+        } else {
+          await this.postTask(task.task_id, task.title, task.status === "done", opts.threadTs);
         }
       }
 
@@ -328,12 +358,87 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     }
   }
 
+  // ---- タスクのチェックボックス（チェック＝完了） ----
+
+  /**
+   * タスク 1 件を「チェックボックス 1 個」として描く。
+   *
+   * 通知して終わりにせず、その場で状態を進められる形で出すのが要点。
+   * 「終わりましたか?」と聞いて「はい/いいえ」を押させるより、
+   * チェックボックス 1 つの方が押す手間も往復も少ない。
+   */
+  private renderTaskBlocks(taskId: string, title: string, done: boolean): unknown[] {
+    // Slack のオプションラベルは 150 文字まで。完了済みは打ち消し線で見せる。
+    const label = title.slice(0, 150);
+    const option = {
+      text: { type: "mrkdwn" as const, text: done ? `~${label}~` : label },
+      value: taskId,
+    };
+    const checkboxes: Record<string, unknown> = {
+      type: "checkboxes",
+      action_id: "task_toggle",
+      options: [option],
+    };
+    // initial_options は空配列を渡すと Slack がエラーにするので、完了時だけ付ける。
+    // また initial_options の要素は options の要素と完全一致していなければならない。
+    if (done) checkboxes.initial_options = [option];
+
+    // block_id にタスクを載せて往復させる（承認ボタンの approval:<id> と同じ流儀）。
+    return [{ type: "actions", block_id: `task:${taskId}`, elements: [checkboxes] }];
+  }
+
+  /** タスクをチェックボックス付きで Slack に投稿する。 */
+  async postTask(taskId: string, title: string, done = false, threadTs?: string) {
+    await this.slackPost({
+      // blocks を出す場合も text は入れる（通知プレビュー・アクセシビリティ用）。
+      text: title,
+      ...(threadTs ? { thread_ts: threadTs } : {}),
+      blocks: this.renderTaskBlocks(taskId, title, done),
+    });
+  }
+
+  /**
+   * チェックボックスが押されたとき。チェック＝完了、外す＝open にする（元の状態には戻らない）。
+   *
+   * 承認ボタンと同じく状態機械を動かす操作だが、承認と違って外部作用は伴わない。
+   * そのため承認ゲートは要らず、その場で台帳を更新してよい。
+   */
+  async handleTaskToggle(payload: any, action: any) {
+    const blockId: string = action.block_id ?? "";
+    const taskId = blockId.startsWith("task:") ? blockId.slice("task:".length) : "";
+    if (!taskId) return { ok: true };
+
+    const row = this.sql<{ title: string }>`
+      SELECT title FROM tasks WHERE task_id = ${taskId}
+    `[0];
+    if (!row) return { ok: true };
+
+    // Slack は「いま選択されている選択肢の集合」を送ってくる。
+    // 選択肢が 1 つしかないので、空かどうかがそのままチェック状態になる。
+    const done = (action.selected_options ?? []).length > 0;
+    // markTaskStatus 経由なので、完了は task_events にも 1 件残る。
+    this.markTaskStatus(taskId, done ? "done" : "open");
+
+    // 元メッセージを最新の状態で描き直す。
+    if (payload.response_url) {
+      await fetch(payload.response_url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          replace_original: true,
+          text: row.title,
+          blocks: this.renderTaskBlocks(taskId, row.title, done),
+        }),
+      });
+    }
+    return { ok: true };
+  }
+
   // ---- フロー C: 承認ボタン（human-in-the-loop） ----
 
   /** 承認/却下ボタン付きメッセージ（Block Kit）を投稿する。 */
   async postApprovalRequest(taskId: string, title: string, threadTs?: string) {
     await this.slackPost({
-      // blocks を出す場合も text は入れる（通知プレビュー・アクセシビリティ用）。
       text: `承認依頼: ${title}`,
       ...(threadTs ? { thread_ts: threadTs } : {}),
       blocks: [
@@ -377,6 +482,12 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     }
     const action = payload.actions?.[0];
     if (!action) return { ok: true };
+
+    // ボタンの種類でディスパッチする。UI を足すときはここに 1 本足す。
+    if (action.action_id === "task_toggle") {
+      return this.handleTaskToggle(payload, action);
+    }
+
     if (action.action_id !== "approve" && action.action_id !== "reject") {
       return { ok: true };
     }
@@ -528,6 +639,8 @@ ${JSON.stringify(calendarEvents)}`;
     return this.askLlm(`定期チェック（heartbeat）です。
 コンテキストのタスク台帳・カレンダー予定を見直し、今本当に必要なアクションだけを返してください。
 - 期限が近い/過ぎたタスクなど、価値のある注意喚起だけを行う
+- 注意喚起は短い reply 1 通に留め、対象タスクには show_task を必ず併せて出す
+  （その場でチェックして完了にできる形にする）
 - 特に伝えるべきことがなければ actions は空配列にする（無意味な発信をしない）
 
 # 自律レベル
