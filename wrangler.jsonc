@@ -4,8 +4,16 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  // console のログは Cloudflare 側に保存され、問題が起きた後からダッシュボードで検索できる。
   "observability": {
     "enabled": true
+  },
+  // ログの詳細度。error / info / verbose。
+  // verbose にすると「何を受け取り、LLM がどう解釈し、何を実行しようとしたか」まで出る。
+  // 中で何が起きているかを読めることがこのサンプルの目的なので、既定は verbose にしてある。
+  // ただしカレンダーの内容やタスク名がそのままログに載るため、日常的に使うなら info に落とす。
+  "vars": {
+    "LOG_LEVEL": "verbose"
   },
   // Agents SDK の Agent は SQLite-backed Durable Object 上で動く。
   // 1 ユーザー = 1 instance（名前 "ai-agent"）で運用する（詳細は CONCEPT.md 原則 1）。

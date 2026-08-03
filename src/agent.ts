@@ -3,6 +3,7 @@ import { generate } from "./gemini";
 // 行動空間の宣言（型とスキーマ）は actions.ts にまとめてある。
 import { ACTIONS_SCHEMA, type Action } from "./actions";
 import { listUpcomingEvents, insertEvent, type CalendarEvent } from "./google";
+import { createLogger, type Logger } from "./log";
 
 // Cloudflare.Env は `wrangler types` が生成する（worker-configuration.d.ts）。
 // Durable Object のバインディングはそこで型付け済みなので、ここではシークレットだけ足す。
@@ -131,6 +132,19 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     if (!hasHeartbeat) {
       await this.rescheduleHeartbeat();
     }
+  }
+
+  // ---- ログ ----
+
+  private logger?: Logger;
+
+  /**
+   * env を読むのは this が使えるようになってからなので、初回アクセス時に作る。
+   * 出力先は console だけ。observability を有効にしてあるので、
+   * 問題が起きた後から Cloudflare のダッシュボードで検索できる。
+   */
+  protected get log(): Logger {
+    return (this.logger ??= createLogger(this.env.LOG_LEVEL));
   }
 
   // ---- フロー B: heartbeat（自律ループ） ----
@@ -274,12 +288,13 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     // 最初に話しかけてきたユーザーを所有者として学習する。
     if (this.state.slackUserId === "UXXXXXXXX" && user) {
       this.setState({ ...this.state, slackUserId: user });
-      console.log(`bootstrapped owner slackUserId = ${user}`);
+      this.log.info("owner.bootstrapped", { user });
     }
 
     // 所有者以外は拒否（allowlist）。チャンネルの他メンバーの発言はここで弾かれる。
     // 「所有者しか使えない」を既定にする（CONCEPT.md 原則 4「安全側に倒す」）。
     if (user && user !== this.state.slackUserId) {
+      this.log.info("slack.rejected", { user });
       return { ok: false, reason: "user not allowed" };
     }
 
@@ -292,6 +307,8 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     const text: string = event.text ?? "";
     // スレッド内の発言なら thread_ts が入る。返信も同じスレッドに返す。
     const threadTs: string | undefined = event.thread_ts;
+
+    this.log.verbose("slack.recv", { type: event.type, channel, thread: threadTs, text });
 
     const actions = await this.askLlmForSlackReply(text);
     await this.applyActions(actions, { threadTs });
@@ -311,6 +328,9 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
    */
   async applyActions(actions: Action[], opts: { threadTs?: string } = {}) {
     for (const action of actions) {
+      // 「何を実行しようとしたか」。副作用が起きる直前にここだけ見れば追える。
+      this.log.verbose("apply.action", action);
+
       if (action.type === "reply" || action.type === "ask_user") {
         await this.postSlackMessage(action.message, opts.threadTs);
       }
@@ -564,7 +584,7 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
       this.markTaskStatus(taskId, "done");
       await this.postSlackMessage(`📅 カレンダーに追加しました: ${ev.summary}（${ev.start}）`);
     } catch (err) {
-      console.error("executeTask failed:", err);
+      this.log.error("task.execute.failed", { taskId, error: String(err) });
       // 失敗を握り潰さない。done でも waiting_user でもない error という行き先を用意する。
       this.markTaskStatus(taskId, "error");
       await this.postSlackMessage(`⚠️ 予定の追加に失敗しました: ${row.title}`);
@@ -601,7 +621,7 @@ ${JSON.stringify(calendarEvents)}`;
     try {
       return await listUpcomingEvents(this.env, { maxResults: 10 });
     } catch (err) {
-      console.error("Calendar fetch failed:", err);
+      this.log.error("calendar.fetch.failed", String(err));
       return [];
     }
   }
@@ -614,9 +634,13 @@ ${JSON.stringify(calendarEvents)}`;
 
   protected async slackPost(body: Record<string, unknown>) {
     if (!this.state.slackChannelId) {
-      console.warn("slackPost skipped: slackChannelId is not set yet");
+      this.log.error("slack.post.skipped", "slackChannelId is not set yet");
       return;
     }
+    this.log.verbose("slack.post", {
+      text: body.text,
+      blocks: Array.isArray(body.blocks) ? body.blocks.length : 0,
+    });
     const res = await fetch("https://slack.com/api/chat.postMessage", {
       method: "POST",
       headers: {
@@ -628,7 +652,7 @@ ${JSON.stringify(calendarEvents)}`;
     // Slack は HTTP 200 でも { ok: false, error } を返すことがある。
     const data = (await res.json()) as { ok: boolean; error?: string };
     if (!data.ok) {
-      console.error(`Slack postMessage failed: ${data.error}`);
+      this.log.error("slack.post.failed", { error: data.error });
     }
   }
 
@@ -669,6 +693,9 @@ ${this.state.autonomyLevel}`);
    */
   async askLlm(prompt: string): Promise<Action[]> {
     const full = `${await this.buildAssistantContext()}\n\n---\n\n${prompt}`;
+    // 「どう解釈したか」を追うには、送った全文と返ってきたアクションの両方が要る。
+    // 片方だけでは、LLM が悪いのかプロンプトが悪いのか切り分けられない。
+    this.log.verbose("llm.prompt", full);
     try {
       const result = await generate<{ actions: Action[] }>({
         apiKey: this.env.GEMINI_API_KEY,
@@ -676,9 +703,11 @@ ${this.state.autonomyLevel}`);
         prompt: full,
         schema: ACTIONS_SCHEMA,
       });
-      return result.actions ?? [];
+      const actions = result.actions ?? [];
+      this.log.verbose("llm.actions", actions);
+      return actions;
     } catch (err) {
-      console.error("LLM call failed:", err);
+      this.log.error("llm.failed", String(err));
       return [];
     }
   }

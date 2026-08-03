@@ -1,6 +1,7 @@
 import { routeAgentRequest, getAgentByName } from "agents";
 import { PersonalAssistantAgent, type Env } from "./agent";
 import { verifySlackRequest } from "./slack";
+import { createLogger } from "./log";
 
 // wrangler.jsonc の durable_objects.bindings.class_name と対応させるため、
 // Worker のエントリポイントから Agent クラスを re-export する必要がある。
@@ -32,6 +33,14 @@ export default {
       if (payload.type === "url_verification") {
         return Response.json({ challenge: payload.challenge });
       }
+
+      // Slack がリトライしてきたかどうかは、この 2 ヘッダにしか現れない。
+      // 同じ発言が二重に処理される類の不具合は、まずここを見て切り分ける。
+      createLogger(env.LOG_LEVEL).verbose("slack.http", {
+        event_id: payload.event_id,
+        retry: request.headers.get("x-slack-retry-num"),
+        reason: request.headers.get("x-slack-retry-reason"),
+      });
 
       const agent = await getAgentByName<Env, PersonalAssistantAgent>(
         env.PersonalAssistantAgent,
