@@ -1,0 +1,31 @@
+{
+  "display_information": {
+    "name": "minimal-ai-agent",
+    "description": "個人アシスタント Agent (Cloudflare Agents + Gemini)",
+    "background_color": "#2b2d31"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "minimal-ai-agent",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": ["chat:write", "app_mentions:read", "im:history", "im:read", "im:write"]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://minimal-ai-agent.YOUR-SUBDOMAIN.workers.dev/slack/events",
+      "bot_events": ["app_mention", "message.im"]
+    },
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "https://minimal-ai-agent.YOUR-SUBDOMAIN.workers.dev/slack/interactivity"
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
