@@ -41,6 +41,9 @@ export type AssistantState = {
 // 「設定ミスで連投・課金・枠の枯渇が起きる方向には倒さない」（CONCEPT.md 原則 4「安全側に倒す」）。
 const HEARTBEAT_INTERVAL_MIN = 120;
 
+// 重複排除のために覚えておく発言の件数。直近ぶんだけあれば足りる。
+const PROCESSED_EVENT_KEEP = 200;
+
 const SYSTEM_PROMPT = `あなたは個人アシスタント（秘書）Agent です。
 毎回のプロンプトには「未完了タスク・カレンダー予定」のコンテキストが与えられます。
 これらを踏まえ、次に取るべきアクションを JSON で返します。
@@ -114,6 +117,14 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
         task_id TEXT,
         type TEXT,
         message TEXT,
+        created_at TEXT NOT NULL
+      )
+    `;
+    // 同じ発言を二度処理しないための記録。ts は Slack の「発言そのもの」の識別子で、
+    // 二重配信でもリトライでも同じ値になる（event_id は配信ごとに変わるので使えない）。
+    this.sql`
+      CREATE TABLE IF NOT EXISTS processed_events (
+        ts TEXT PRIMARY KEY,
         created_at TEXT NOT NULL
       )
     `;
@@ -284,6 +295,16 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     // これを忘れると、自分の投稿に自分が反応して無限ループする。
     if (event.bot_id || event.subtype) return { ok: true };
 
+    // 同じ発言が二重に届くことがある。経路は 2 つあり、どちらも実際に踏んだ。
+    //   1. チャンネルでメンションすると app_mention と message.* が両方配信される
+    //      （event_id は別だが、発言の識別子である ts は同じ）
+    //   2. 3 秒以内に 200 を返せないと Slack がリトライする（event_id も同じ）
+    // 弾かないと、同じ問いに 2 回別々の答えを返すことになる。
+    if (!this.claimSlackEvent(event.ts)) {
+      this.log.info("slack.duplicate", { ts: event.ts, type: event.type });
+      return { ok: true };
+    }
+
     const user: string | undefined = event.user;
     const channel: string | undefined = event.channel;
 
@@ -311,7 +332,13 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     // スレッド内の発言なら thread_ts が入る。返信も同じスレッドに返す。
     const threadTs: string | undefined = event.thread_ts;
 
-    this.log.verbose("slack.recv", { type: event.type, channel, thread: threadTs, text });
+    this.log.verbose("slack.recv", {
+      type: event.type,
+      channel,
+      thread: threadTs,
+      ts: event.ts,
+      text,
+    });
 
     // 行頭 "TODO:" のような明示コマンドは LLM を通さず、書かれたとおりに登録する。
     // ここを LLM に通すと「登録しますか?」の確認や、タイトルの勝手な言い換えが混ざる。
@@ -325,6 +352,28 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     const actions = await this.askLlmForSlackReply(text);
     await this.applyActions(actions, { threadTs });
     return { ok: true };
+  }
+
+  /**
+   * この発言をまだ処理していなければ記録して true を返す（既に処理済みなら false）。
+   * Durable Object は単一実行モデルなので、この読み書きに競合は起きない。
+   */
+  private claimSlackEvent(ts: string | undefined): boolean {
+    // ts を持たない形の event は素通しする（弾く根拠が無いものを弾かない）。
+    if (!ts) return true;
+    const seen = this.sql`SELECT 1 FROM processed_events WHERE ts = ${ts} LIMIT 1`;
+    if (seen.length > 0) return false;
+    this.sql`
+      INSERT INTO processed_events (ts, created_at)
+      VALUES (${ts}, ${new Date().toISOString()})
+    `;
+    // 台帳と同じで、残すものを設計する。古い分は重複排除に要らない。
+    this.sql`
+      DELETE FROM processed_events WHERE rowid NOT IN (
+        SELECT rowid FROM processed_events ORDER BY rowid DESC LIMIT ${PROCESSED_EVENT_KEEP}
+      )
+    `;
+    return true;
   }
 
   /**

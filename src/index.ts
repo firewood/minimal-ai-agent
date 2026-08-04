@@ -19,6 +19,7 @@ const AGENT_NAME = "ai-agent";
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const log = createLogger(env.LOG_LEVEL);
 
     // --- Slack Events API: メッセージ・メンションの受信 ---
     if (url.pathname === "/slack/events" && request.method === "POST") {
@@ -36,24 +37,21 @@ export default {
 
       // Slack がリトライしてきたかどうかは、この 2 ヘッダにしか現れない。
       // 同じ発言が二重に処理される類の不具合は、まずここを見て切り分ける。
-      createLogger(env.LOG_LEVEL).verbose("slack.http", {
+      log.verbose("slack.http", {
         event_id: payload.event_id,
         retry: request.headers.get("x-slack-retry-num"),
         reason: request.headers.get("x-slack-retry-reason"),
       });
 
-      const agent = await getAgentByName<Env, PersonalAssistantAgent>(
-        env.PersonalAssistantAgent,
-        AGENT_NAME,
-      );
       // Slack の 3 秒ルール対策: 即 200 を返し、実処理は背後で続ける。
-      // 3 秒以内に応答しないと Slack はリトライしてくるので、
-      // LLM 呼び出しをレスポンスの手前に置いてはいけない。
-      ctx.waitUntil(agent.handleSlackEvent(payload));
+      // Agent の取得（＝Durable Object の起動）もレスポンスの手前で待ってはいけない。
+      // コールドスタートや一時エラーがそのまま Slack へのタイムアウトになり、
+      // リトライで同じ発言が二度届く。await を 1 つ残すだけでこうなる。
+      ctx.waitUntil(handOff(env, log, "slack.events", (agent) => agent.handleSlackEvent(payload)));
       return Response.json({ ok: true });
     }
 
-    // --- Slack Interactivity: ボタン押下（承認/却下）---
+    // --- Slack Interactivity: ボタン押下（承認/却下・チェックボックス）---
     if (url.pathname === "/slack/interactivity" && request.method === "POST") {
       const verified = await verifySlackRequest(request, env.SLACK_SIGNING_SECRET);
       if (!verified.ok) {
@@ -67,13 +65,11 @@ export default {
       if (!raw) return new Response("Bad Request", { status: 400 });
       const payload = JSON.parse(raw);
 
-      const agent = await getAgentByName<Env, PersonalAssistantAgent>(
-        env.PersonalAssistantAgent,
-        AGENT_NAME,
-      );
       // 即 200（空ボディ）。Slack はこれで元メッセージを変えない。
       // 元メッセージの差し替えは Agent 側が response_url で行う。
-      ctx.waitUntil(agent.handleSlackInteraction(payload));
+      ctx.waitUntil(
+        handOff(env, log, "slack.interactivity", (agent) => agent.handleSlackInteraction(payload)),
+      );
       return new Response("", { status: 200 });
     }
 
@@ -84,3 +80,26 @@ export default {
     );
   },
 } satisfies ExportedHandler<Env>;
+
+/**
+ * Agent を起こして仕事を渡す。レスポンスを返したあとに走らせるための包み。
+ *
+ * この時点で 200 は返しているので、ここで落ちても Slack はリトライしない。
+ * つまり失敗した発言はそのまま失われる。だから必ずログに残す。
+ */
+async function handOff(
+  env: Env,
+  log: ReturnType<typeof createLogger>,
+  where: string,
+  work: (agent: DurableObjectStub<PersonalAssistantAgent>) => unknown,
+): Promise<void> {
+  try {
+    const agent = await getAgentByName<Env, PersonalAssistantAgent>(
+      env.PersonalAssistantAgent,
+      AGENT_NAME,
+    );
+    await work(agent);
+  } catch (err) {
+    log.error(`${where}.failed`, String(err));
+  }
+}
