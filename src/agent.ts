@@ -4,6 +4,7 @@ import { generate } from "./gemini";
 import { ACTIONS_SCHEMA, type Action } from "./actions";
 import { listUpcomingEvents, insertEvent, type CalendarEvent } from "./google";
 import { createLogger, type Logger } from "./log";
+import { parseTaskLines } from "./task-prefix";
 
 // Cloudflare.Env は `wrangler types` が生成する（worker-configuration.d.ts）。
 // Durable Object のバインディングはそこで型付け済みなので、ここではシークレットだけ足す。
@@ -49,7 +50,9 @@ const SYSTEM_PROMPT = `あなたは個人アシスタント（秘書）Agent で
   ユーザーの発言をそのまま繰り返さない。付け加えることが無いなら、次の一歩を短く示す。
 - ユーザーに確認・判断を求める問いかけは ask_user。
 - create_task はユーザーが明示的に依頼したときだけ使う。推測でタスク化しない。
-  実行前に承認が要るものは requires_user_approval=true にする。
+  title は短い名詞句にする。説明・補足・言い換え・スキーマのフィールド名を混ぜてはならない
+  （承認の要否は title に書くのではなく requires_user_approval に入れる）。
+  行頭に「TODO:」を付けた発言はコードが直接登録するので、あなたは関与しない。
 - カレンダーに予定を追加すべきときは create_event（title と start[ISO8601] は必須）。
   実世界に作用するため必ず承認を挟む。曖昧なら ask_user で確認する。
 - 既存タスクへの注意喚起・着手の促し・進捗確認には必ず show_task を添える。
@@ -310,9 +313,29 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
 
     this.log.verbose("slack.recv", { type: event.type, channel, thread: threadTs, text });
 
+    // 行頭 "TODO:" のような明示コマンドは LLM を通さず、書かれたとおりに登録する。
+    // ここを LLM に通すと「登録しますか?」の確認や、タイトルの勝手な言い換えが混ざる。
+    const taskTitles = parseTaskLines(text);
+    if (taskTitles.length > 0) {
+      this.log.verbose("command.recognized", { command: "task-prefix", titles: taskTitles });
+      await this.registerPrefixedTasks(taskTitles, threadTs);
+      return { ok: true };
+    }
+
     const actions = await this.askLlmForSlackReply(text);
     await this.applyActions(actions, { threadTs });
     return { ok: true };
+  }
+
+  /**
+   * プレフィックス付き発言から拾ったタスクを登録し、その場でチェックできる形で出す。
+   * source を "slack:todo" にして、LLM が作ったタスクと台帳上で区別できるようにする。
+   */
+  private async registerPrefixedTasks(titles: string[], threadTs?: string) {
+    for (const title of titles) {
+      const taskId = this.createTask(title, { source: "slack:todo" });
+      await this.postTask(taskId, title, false, threadTs);
+    }
   }
 
   // ---- applyActions: LLM の出力を副作用に変える翻訳層 ----
