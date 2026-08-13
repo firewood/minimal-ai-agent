@@ -19,7 +19,8 @@ Slack Interactivity ─┘   ・Slack 署名検証
                          ・URL 検証チャレンジ応答
                          └─▶ PersonalAssistantAgent (src/agent.ts)  一意名 "ai-agent"
                               ├─ this.state       … 設定 / 自律レベル / 学習済み Slack ID
-                              ├─ this.sql (SQLite)… tasks / task_events / user_decisions
+                              ├─ this.sql (SQLite)… tasks / task_events
+                              │                     processed_events / user_decisions
                               ├─ schedule()       … heartbeat（2 時間ごと自律チェック）
                               ├─ Gemini API       … 次アクションを structured JSON で生成
                               ├─ Google Calendar  … 直近予定の読み取り / 予定の作成
@@ -50,6 +51,8 @@ Agent に渡す。ビジネスロジックはすべて Agent 側に集約する�
 Gemini の役割は **「状況を見て、次に取るべきアクションを決める」ことだけ** に限定する。
 
 - LLM の出力は structured output で強制した **閉じたアクション語彙** の JSON のみ。自由文をパースしない。
+  ただしスキーマが保証するのは「その形の JSON であること」までで、語彙に本当に合っているかは別問題である
+  （後述の「スキーマは型ではない」）。
 - アクションの **実行** はすべて TypeScript コードが担う。DB 書き込み・Slack 投稿・カレンダー操作は
   決定的なコードパスであり、LLM は一切触れない。
 - 新しい能力を足すとき増えるのは「アクションの種類」であって、LLM への信頼ではない。
@@ -81,6 +84,9 @@ Gemini の役割は **「状況を見て、次に取るべきアクションを�
 - **既定は控えめに**: 自律動作の頻度は 2 時間間隔。設定ミスで連投・課金・枠の枯渇が起きる方向には倒さない。
 - **壊れても止まらない**: Gemini 呼び出しの失敗は空アクションに、Calendar 未設定は空配列に落とす。
   個々の連携が落ちても Agent 全体は生き続ける。
+- **信じずに検証する**: LLM が返した値は、内側に入る境界で 1 件ずつ確認する。型注釈（`as`）は
+  検査ではなく宣言にすぎず、欠けたフィールドは消えないまま副作用に届く。
+  捨てるのは成立しない要素だけにして、1 件の欠落で正常な返信まで失わないようにする。
 
 ---
 
@@ -89,7 +95,7 @@ Gemini の役割は **「状況を見て、次に取るべきアクションを�
 | 置き場所 | 用途 | 例 |
 |---|---|---|
 | `this.state`（永続 JSON） | 設定・軽量な学習値 | 自律レベル、タイムゾーン、所有者の Slack User ID / Channel ID |
-| `this.sql`（ローカル SQLite） | 台帳・履歴 | `tasks` / `task_events` / `user_decisions` |
+| `this.sql`（ローカル SQLite） | 台帳・履歴 | `tasks` / `task_events` / `processed_events` / `user_decisions` |
 | メモリ変数 | isolate 内キャッシュのみ | Google アクセストークンの短期キャッシュ |
 
 中央 DB は「複数 Agent 横断の管理画面」「分析集計」「バックアップ」が必要になったら
@@ -109,6 +115,7 @@ Agent：Bot 自身の投稿は無視（無限ループ防止）
 Agent → Calendar：直近予定を取得
 Agent → Gemini：メッセージ＋台帳＋予定を渡し、アクション配列を JSON で要求
 Gemini → Agent：{ actions: [...] }
+Agent：検証（アクションとして成立しない要素は捨ててログに残す）
 Agent：applyActions() でタスク登録 or Slack 返信 or 承認依頼
 ```
 
@@ -164,9 +171,36 @@ LLM に返させる structured output のスキーマ。**スキーマ設計 = �
 | `create_event` | カレンダーに予定を作成 | **Google Calendar 書き込み** | **必須** |
 
 union 型は使わず「`type` フィールドで分岐する 1 種類のオブジェクト」に寄せている。
-Gemini の `responseSchema` は OpenAPI サブセットで、`oneOf` の扱いがモデルによって不安定なため。
+Gemini の `responseSchema` は OpenAPI のサブセットで、`oneOf` に頼れないため。
 
 **能力を足す = アクションを足す** であって、LLM への指示を増やすことではない。
+
+### スキーマは型ではない
+
+上の「1 種類のオブジェクトに寄せる」には代償がある。`oneOf` が無いので「`reply` なら `message` が必須」
+を表現できず、各要素の `required` は `["type"]` だけになる。どのフィールドも省略され得るスキーマになる。
+
+つまり `{"type":"reply"}` は**スキーマには適合するが、アクションとしては成立していない**。
+これをそのまま TypeScript の `Action` 型として扱うと、`message` が `undefined` のまま Slack に投稿され、
+文字列 `"undefined"` が届く。`as Action` と書いても、コンパイラが黙るだけで値は変わらない。
+
+structured output が消してくれるのは「自然文をパースする作業」であって、「出力を検証する責任」ではない。
+だから語彙の定義は 4 箇所で揃える。**能力を足すときは 4 つとも増やす。**
+
+| 定義 | 役割 |
+|---|---|
+| `type Action`（`src/actions.ts`） | コード側の型 |
+| `ACTIONS_SCHEMA`（`src/actions.ts`） | LLM 出力の形の強制 |
+| `toAction()`（`src/actions.ts`） | スキーマで縛れない必須項目の確認。通らなければ捨てる |
+| `applyActions()`（`src/agent.ts`） | 実際の副作用 |
+
+検証は境界に 1 つ置くだけでは足りない。承認後に `payload_json` から読み戻して実行する経路
+（フロー C）は、過去のバージョンが書いた行を読むこともあるので、**外部作用の直前でもう一度**同じ関門を通す。
+「入口で検証したから中は安全」は、デプロイをまたぐと成り立たない。
+
+LLM への依存は `src/gemini.ts` 1 ファイルに閉じ、そのファイルが満たすべき契約（スキーマ型と
+`Generate`）は `src/llm.ts` に型だけで置いてある。行動空間を定義する `actions.ts` が特定のベンダに
+依存しないので、モデルを差し替える作業は「契約を満たすファイルを 1 つ書く」ことに閉じる。
 
 ### 通知ではなく操作を出す
 
@@ -188,7 +222,7 @@ Gemini の `responseSchema` は OpenAPI サブセットで、`oneOf` の扱い�
 | 01 | コアコンセプトと読み方 | このドキュメント |
 | 02 | Worker + Agent の骨組み | Agents SDK の Agent と Durable Object の関係、`this.state` |
 | 03 | Task Ledger（Agent ローカル SQLite） | `this.sql`、状態機械をテーブルで表す |
-| 04 | Gemini を薄いラッパーに隔離し、アクション語彙を閉じる | structured output、LLM の交換可能性 |
+| 04 | Gemini を薄いラッパーに隔離し、アクション語彙を閉じる | structured output。行動空間（`src/actions.ts`）と LLM との契約（`src/llm.ts`）を宣言として切り出す |
 | 05 | Slack 入口（署名検証・3 秒ルール・所有者の自動学習） | Gateway と Agent の責務分離、fail-closed |
 | 06 | applyActions — LLM の出力を副作用に変える翻訳層 | エージェントの心臓部。ここに副作用を一点集中させる |
 | 07 | heartbeat — schedule() による自律ループ | イベント駆動と自律ループが同じ状態を共有する |
@@ -199,5 +233,6 @@ Gemini の `responseSchema` は OpenAPI サブセットで、`oneOf` の扱い�
 | 12 | 行頭 `TODO:` をコードで直接タスク登録する | 原則 2 の例外。書式が決まっているなら解釈させない |
 | 13 | 同じ発言への二重応答を止め、3 秒ルールを実際に守る | ログを入れて最初に見つかった不具合 2 件 |
 | 14 | セットアップ手順 | 動かし方 |
+| 15 | LLM の出力を検証してから副作用に渡す | スキーマは型ではない。`as` は検査ではない |
 
 各 commit は単体で型チェックが通る。`git checkout <commit>` して読み進められる。

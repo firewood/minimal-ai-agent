@@ -1,7 +1,7 @@
 import { Agent } from "agents";
 import { generate } from "./gemini";
-// 行動空間の宣言（型とスキーマ）は actions.ts にまとめてある。
-import { ACTIONS_SCHEMA, type Action } from "./actions";
+// 行動空間の定義（型・スキーマ）とその検証は actions.ts にまとめてある。
+import { ACTIONS_SCHEMA, toAction, parseActionsResponse, type Action } from "./actions";
 import { listUpcomingEvents, insertEvent, type CalendarEvent } from "./google";
 import { createLogger, type Logger } from "./log";
 import { parseTaskLines } from "./task-prefix";
@@ -631,7 +631,9 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
 
     let action: Action | null = null;
     try {
-      action = row.payload_json ? (JSON.parse(row.payload_json) as Action) : null;
+      // 台帳に入る前に検証済みだが、DB には旧バージョンが書いた行も残る。
+      // 外部作用（カレンダー書き込み）の直前なので、ここでもう一度通す。
+      action = row.payload_json ? toAction(JSON.parse(row.payload_json)) : null;
     } catch {
       action = null;
     }
@@ -769,13 +771,20 @@ ${this.state.autonomyLevel}`);
     // 片方だけでは、LLM が悪いのかプロンプトが悪いのか切り分けられない。
     this.log.verbose("llm.prompt", full);
     try {
-      const result = await generate<{ actions: Action[] }>({
+      const { actions, dropped } = await generate({
         apiKey: this.env.GEMINI_API_KEY,
         systemInstruction: SYSTEM_PROMPT,
         prompt: full,
         schema: ACTIONS_SCHEMA,
+        // 型を宣言するのではなく、検証関数を渡す。
+        // ここを通らなかった出力は Agent の内側に入らない。
+        parse: parseActionsResponse,
       });
-      const actions = result.actions ?? [];
+      // スキーマは通ったのに Action として成立していない出力。
+      // プロンプトかスキーマ側の問題なので、黙って捨てずに残す。
+      if (dropped.length > 0) {
+        this.log.error("llm.actions.invalid", dropped);
+      }
       this.log.verbose("llm.actions", actions);
       return actions;
     } catch (err) {

@@ -3,15 +3,16 @@
 雑誌記事「**エージェント自作で学ぶLLMの組み込み方**」の解説用リポジトリ。
 
 Cloudflare Agents SDK + Gemini API + Slack + Google Calendar で、
-「先回りして動く個人アシスタント Agent」を作る。実装は 7 ファイル・約 960 行
-（解説コメントを含めて 1,450 行）。
+「先回りして動く個人アシスタント Agent」を作る。実装は 9 ファイル・約 1,030 行
+（解説コメントを含めて 1,600 行）。
 
 ```
 Slack Events ───────▶┐   Cloudflare Worker (src/index.ts)  ← Gateway
 Slack Interactivity ─┘   ・Slack 署名検証
                          └─▶ PersonalAssistantAgent (src/agent.ts)  一意名 "ai-agent"
                               ├─ this.state       … 設定 / 所有者の Slack ID
-                              ├─ this.sql (SQLite)… tasks / task_events / user_decisions
+                              ├─ this.sql (SQLite)… tasks / task_events
+                              │                     processed_events / user_decisions
                               ├─ schedule()       … heartbeat（2 時間ごと自律チェック）
                               ├─ Gemini API       … 次アクションを structured JSON で生成
                               ├─ Google Calendar  … 予定の読み取り / 作成
@@ -36,7 +37,9 @@ git log --oneline --reverse
 |---|---|
 | `src/index.ts` | Worker（ゲートウェイ）。署名検証とルーティングだけ |
 | `src/agent.ts` | Agent 本体。状態・台帳・スケジュール・アクションの実行 |
-| `src/gemini.ts` | LLM の薄いラッパー。structured output で JSON を強制 |
+| `src/actions.ts` | 行動空間。`Action` 型・スキーマ・LLM 出力の検証（純関数） |
+| `src/llm.ts` | LLM との契約（型のみ）。アダプタが満たすべき形 |
+| `src/gemini.ts` | 契約の実装。structured output で JSON を強制 |
 | `src/slack.ts` | Slack 署名検証（Web Crypto のみ） |
 | `src/google.ts` | Google Calendar（サービスアカウント + JWT 自前署名） |
 | `src/log.ts` | ログレベルの判定と整形 |
@@ -210,7 +213,8 @@ pnpm exec wrangler tail        # ライブ
 | | `slack.duplicate` | 二重に届いた発言を弾いたとき（`info` レベル） |
 | 解釈 | `command.recognized` | `TODO:` のような明示コマンドを拾ったとき。これが出たら LLM は通らない |
 | | `llm.prompt` | LLM に送った全文（コンテキスト込み） |
-| | `llm.actions` | 返ってきたアクション配列 |
+| | `llm.actions` | 返ってきたアクション配列（検証を通ったものだけ） |
+| | `llm.actions.invalid` | スキーマは通ったが `Action` として成立せず捨てた要素（`error` レベル）。出続けるならプロンプトかスキーマの問題 |
 | 実行 | `apply.action` | 副作用に変える直前のアクション |
 | | `slack.post` | 投稿した本文 |
 
