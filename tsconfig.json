@@ -11,7 +11,10 @@
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    // テストは node --test が .ts をそのまま実行する（型を落として走らせる）。
+    // Node の ESM は拡張子を省略できないので、import 側は "../src/actions.ts" と書く。
+    "allowImportingTsExtensions": true
   },
-  "include": ["src/**/*.ts", "worker-configuration.d.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "worker-configuration.d.ts"]
 }

@@ -3,8 +3,8 @@
 雑誌記事「**エージェント自作で学ぶLLMの組み込み方**」の解説用リポジトリ。
 
 Cloudflare Agents SDK + Gemini API + Slack + Google Calendar で、
-「先回りして動く個人アシスタント Agent」を作る。実装は 9 ファイル・約 1,030 行
-（解説コメントを含めて 1,600 行）。
+「先回りして動く個人アシスタント Agent」を作る。実装は 9 ファイル・約 1,140 行
+（解説コメントを含めて 1,780 行）。テストは別に 5 ファイル・約 490 行。
 
 ```
 Slack Events ───────▶┐   Cloudflare Worker (src/index.ts)  ← Gateway
@@ -44,6 +44,31 @@ git log --oneline --reverse
 | `src/google.ts` | Google Calendar（サービスアカウント + JWT 自前署名） |
 | `src/log.ts` | ログレベルの判定と整形 |
 | `src/task-prefix.ts` | 行頭 `TODO:` の解析。LLM を通さない唯一の経路 |
+| `test/*.test.ts` | 純関数のテスト。`node --test` で走る（テスト用の依存は無い） |
+
+---
+
+## テスト
+
+```bash
+pnpm test        # node --test test/*.test.ts
+pnpm typecheck
+```
+
+Node 24 が `.ts` をそのまま実行できるので、`node:test` と `node:assert` だけで足りる。
+vitest も設定ファイルも無い。
+
+対象は Workers ランタイムに依存しない部分に絞ってある。
+
+| テスト | 守っているもの |
+|---|---|
+| `test/actions.test.ts` | LLM 出力の関所。`{"type":"reply"}` のような「スキーマは通るが成立していない」出力を捨てること。**スキーマの `enum` と `toAction` の分岐がずれたら落ちる**ので、アクションを増やすとき片方を忘れられない |
+| `test/slack.test.ts` | 署名検証。改竄・リプレイ・ヘッダ欠落、そして**シークレット未設定で拒否**すること（fail-closed が逆に倒れても正常時の動作は変わらないので、テストでしか気づけない） |
+| `test/task-prefix.test.ts` | `TODO:` の解析。拾うべきものと、拾ってはいけないもの（件数・長さの上限を含む） |
+| `test/gemini.test.ts` | LLM 境界の契約。`fetch` を差し替え、`responseSchema` を必ず送ること、`parse` にパース済みの値が渡ること、失敗時に投げること |
+
+**Durable Object の中（`applyActions` / 状態機械 / 重複排除）はテストしていない。** workerd が必要で、
+`@cloudflare/vitest-pool-workers` を入れることになるため。ここは `pnpm dev` での手動確認に頼っている。
 
 ---
 
