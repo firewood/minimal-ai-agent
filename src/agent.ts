@@ -45,13 +45,30 @@ const HEARTBEAT_INTERVAL_MIN = 120;
 const PROCESSED_EVENT_KEEP = 200;
 
 const SYSTEM_PROMPT = `あなたは個人アシスタント（秘書）Agent です。
-毎回のプロンプトには「未完了タスク・カレンダー予定」のコンテキストが与えられます。
+毎回のプロンプトには「現在時刻・未完了タスク・カレンダー予定・直近の声かけ」が与えられます。
 これらを踏まえ、次に取るべきアクションを JSON で返します。
+
+# あなたの仕事は「聞かれたら答える」ことではない
+指示を待つのではなく、与えられたコンテキストを自分で点検し、ユーザーがまだ気づいていない
+「そろそろ動くべきこと」を先に出す。ただし 1 回につき 1 通までにする。
+言うべきときに言えることと、黙るべきときに黙れることは、同じくらい重要である。
+
+# 発言には必ず「次の一手」を含める
+コンテキストの内容をそのまま読み上げるのは発信ではない。
+「予定があります」「タスクが N 件あります」は、ユーザーが自分で見れば分かることであり、
+伝えても状況は 1 ミリも進まない。書けるのが状況の要約だけなら、黙る方が正しい。
+発言するときは「何が」「いつまでで」「次に何をするか」が分かる形にする。
+
+# 時間の扱い
+- 「現在」に与えられた時刻だけを基準にする。今日の日付を自分で推測してはならない。
+- due_at は必ず現在時刻と比べる。過ぎているものは「過ぎている」と言い切る（曖昧にしない）。
+- created_at / updated_at を見て、登録されたまま動いていないタスクを見つける。
 
 # アクションの使い分け
 - 質問への回答や情報提供は reply。コンテキストの台帳・予定を根拠に具体的に答える。
   ユーザーの発言をそのまま繰り返さない。付け加えることが無いなら、次の一歩を短く示す。
 - ユーザーに確認・判断を求める問いかけは ask_user。
+- 先回りは reply と show_task で行う。台帳を勝手に増やして先回りしたことにはしない。
 - create_task はユーザーが明示的に依頼したときだけ使う。推測でタスク化しない。
   title は短い名詞句にする。説明・補足・言い換え・スキーマのフィールド名を混ぜてはならない
   （承認の要否は title に書くのではなく requires_user_approval に入れる）。
@@ -62,7 +79,17 @@ const SYSTEM_PROMPT = `あなたは個人アシスタント（秘書）Agent で
   task_id はコンテキストの「未完了タスク」からそのまま取る。
   言葉で促すだけにせず、その場でチェックして完了にできる形で出すこと。
 - すでに台帳にあるものを重複して作らない。
-- 何もする必要がなければ actions は空配列にする（無意味な発信をしない）。
+
+# しつこさを避ける
+- reply は 1 回につき 1 通まで。伝えることが複数あるなら 1 通にまとめ、show_task を対象ぶん並べる。
+- 「直近の声かけ」に同じ task_id が 4 時間以内にあるなら、そのタスクには触れない。
+  期限を過ぎているものだけは例外として、再度促してよい。
+- 該当が無ければ actions は空配列にする。空配列は失敗ではない。
+
+# 自律レベル
+- suggest: 声かけと問いかけまで。台帳とカレンダーは自分から変えない。
+- draft / approve_execute: 台帳への登録や承認後の実行に踏み込む（段階的に上げる）。
+先回りするかどうかは自律レベルに依らない。声かけは台帳を変えないので suggest でも行う。
 
 日本語で簡潔に。`;
 
@@ -161,6 +188,51 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     return (this.logger ??= createLogger(this.env.LOG_LEVEL));
   }
 
+  // ---- 時刻 ----
+
+  /**
+   * 「いま」をユーザーのタイムゾーンで表す。
+   *
+   * 時刻の計算をコードに持たせ、LLM には基準値として渡すだけにするのが要点。
+   * LLM は自分が呼ばれた日付を知らないので、これが無いと「期限が近い」も
+   * 「3 日放置」も判断できない。プロンプトで催促しても材料が無ければ動けない。
+   */
+  private localNow(): { iso: string; local: string; hour: number; weekday: number } {
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat("ja-JP", {
+      timeZone: this.state.timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      weekday: "short",
+      // h23 を明示する。ja-JP の既定は実装によって深夜を 24 時と表記することがあり、
+      // そうなると hour が 24 になって静音時間の判定が狂う。
+      hourCycle: "h23",
+    }).formatToParts(now);
+    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+    // 0=日曜。Intl は曜日を文字で返すので、並びから番号に戻す。
+    const weekday = ["日", "月", "火", "水", "木", "金", "土"].indexOf(get("weekday"));
+    return {
+      iso: now.toISOString(),
+      local: `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}（${get("weekday")}）`,
+      hour: Number(get("hour")),
+      weekday,
+    };
+  }
+
+  /**
+   * 自発的な発信を控える時間帯（22:00〜07:00 と土日）。
+   *
+   * 「夜中に通知するな」は時刻から機械的に決まる。LLM に判断させる理由がない
+   * （CONCEPT.md 原則 2「LLM は頭脳、コードは手足」）。
+   */
+  private isQuietHours(): boolean {
+    const { hour, weekday } = this.localNow();
+    return hour >= 22 || hour < 7 || weekday === 0 || weekday === 6;
+  }
+
   // ---- フロー B: heartbeat（自律ループ） ----
 
   /**
@@ -171,13 +243,38 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
    */
   async heartbeat() {
     try {
+      // 静音時間は LLM を呼ばずに終わる（呼んで「空配列を返せ」と頼むより確実で、
+      // API も消費しない）。ただし期限を過ぎたものがあるなら黙らない。
+      if (this.isQuietHours() && !this.hasOverdueTasks()) {
+        this.log.info("heartbeat.quiet", { local: this.localNow().local });
+        return;
+      }
       const actions = await this.askLlmForPlan();
-      await this.applyActions(actions);
+      await this.applyActions(this.withoutEmptyTalk(actions));
     } finally {
       // 途中で失敗しても次回を必ず登録する。
       // ここを try の中に置くと、1 回の失敗で heartbeat の鎖が切れて Agent が永久に眠る。
       await this.rescheduleHeartbeat();
     }
+  }
+
+  /**
+   * 「タスクを伴わない自発的な発言」を落とす。
+   *
+   * 点検リストの候補はどれもタスク起点なので、show_task が付いていない発言は
+   * 「10:00 に予定があります」のような状況の読み上げになっている。それは
+   * ユーザーが自分で見れば分かることで、伝えても状況が進まない。
+   *
+   * プロンプトでも禁じているが、「タスクを伴うか」は決定的に判定できるので
+   * コード側でも閉じる（CONCEPT.md 原則 2「LLM は頭脳、コードは手足」）。
+   * 落としたことはログに残す。黙って捨てると、なぜ静かなのか追えなくなる。
+   */
+  private withoutEmptyTalk(actions: Action[]): Action[] {
+    if (actions.some((a) => a.type === "show_task")) return actions;
+    const talk = actions.filter((a) => a.type === "reply" || a.type === "ask_user");
+    if (talk.length === 0) return actions;
+    this.log.info("heartbeat.empty_talk", talk);
+    return actions.filter((a) => a.type !== "reply" && a.type !== "ask_user");
   }
 
   /** 既存の heartbeat 予約を消して、次回を登録し直す。 */
@@ -271,13 +368,56 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
     `[0];
   }
 
-  /** 未完了タスク（＝Agent が気にかけ続けるべきもの）。 */
+  /**
+   * 未完了タスク（＝Agent が気にかけ続けるべきもの）。
+   *
+   * created_at / updated_at も渡すのが要点。これが無いと LLM は
+   * 「登録されたまま何日も動いていない」を判断できず、催促の理由を持てない。
+   */
   openTasks() {
     return this.sql`
-      SELECT task_id, title, status, priority, due_at
+      SELECT task_id, title, status, priority, due_at, created_at, updated_at
       FROM tasks
       WHERE status IN ('open', 'waiting_user', 'approved', 'executing')
       ORDER BY updated_at DESC LIMIT 30
+    `;
+  }
+
+  /** 期限を過ぎた未完了タスクが 1 件でもあるか（静音時間の例外判定に使う）。 */
+  private hasOverdueTasks(): boolean {
+    const now = new Date().toISOString();
+    return (
+      this.sql`
+        SELECT 1 FROM tasks
+        WHERE status IN ('open', 'waiting_user', 'approved', 'executing')
+          AND due_at IS NOT NULL AND due_at < ${now}
+        LIMIT 1
+      `.length > 0
+    );
+  }
+
+  /**
+   * 「このタスクに声をかけた」を履歴に残す。
+   *
+   * tasks の updated_at は台帳の変更で動くもので、声かけでは動かない。
+   * 催促した事実はどこにも残らないので、task_events に置く。
+   * これが無いと LLM は「前回も同じことを言った」を知り得ず、
+   * 黙るか同じ催促を繰り返すかの二択になる。
+   */
+  private recordNudge(taskId: string) {
+    this.sql`
+      INSERT INTO task_events (event_id, task_id, type, message, created_at)
+      VALUES (${crypto.randomUUID()}, ${taskId}, ${"nudged"}, ${null}, ${new Date().toISOString()})
+    `;
+  }
+
+  /** 直近 24 時間の声かけ。同じ話を繰り返さないための材料として LLM に渡す。 */
+  private recentNudges() {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    return this.sql`
+      SELECT task_id, created_at FROM task_events
+      WHERE type = 'nudged' AND created_at > ${since}
+      ORDER BY created_at DESC LIMIT 20
     `;
   }
 
@@ -429,6 +569,8 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
           await this.postSlackMessage("⚠️ 対象のタスクが見つかりませんでした。", opts.threadTs);
         } else {
           await this.postTask(task.task_id, task.title, task.status === "done", opts.threadTs);
+          // 声をかけた事実を残す。次の heartbeat がこれを見て、同じ催促を繰り返さない。
+          this.recordNudge(task.task_id);
         }
       }
 
@@ -675,13 +817,21 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
    * 視界を 1 つの関数に一元化しておくのが要点。
    */
   protected async buildAssistantContext(): Promise<string> {
+    const now = this.localNow();
     const tasks = this.openTasks();
     const calendarEvents = await this.fetchUpcomingCalendarEvents();
-    return `# 未完了タスク
+    const nudges = this.recentNudges();
+    return `# 現在
+${now.iso} / 現地 ${now.local} ${this.state.timezone}
+
+# 未完了タスク
 ${JSON.stringify(tasks)}
 
 # 今後のカレンダー予定
-${JSON.stringify(calendarEvents)}`;
+${JSON.stringify(calendarEvents)}
+
+# 直近 24 時間の声かけ（同じ話を繰り返さないための記録）
+${JSON.stringify(nudges)}`;
   }
 
   /**
@@ -732,14 +882,51 @@ ${JSON.stringify(calendarEvents)}`;
 
   // ---- LLM への問い合わせ ----
 
-  /** フロー B: 定期チェックで「いま何かすべきか」を決めさせる。 */
+  /**
+   * フロー B: 定期チェックで「いま何かすべきか」を決めさせる。
+   *
+   * 「必要なら言え」ではなく「順に点検して該当を拾え」と書くのが要点。
+   * 前者は判断基準を LLM 任せにするので、遠慮して黙る方に倒れ続ける。
+   * 後者は該当・非該当が決まるので、言うときは言い、無いときは黙る。
+   */
   async askLlmForPlan(): Promise<Action[]> {
-    return this.askLlm(`定期チェック（heartbeat）です。
-コンテキストのタスク台帳・カレンダー予定を見直し、今本当に必要なアクションだけを返してください。
-- 期限が近い/過ぎたタスクなど、価値のある注意喚起だけを行う
-- 注意喚起は短い reply 1 通に留め、対象タスクには show_task を必ず併せて出す
-  （その場でチェックして完了にできる形にする）
-- 特に伝えるべきことがなければ actions は空配列にする（無意味な発信をしない）
+    return this.askLlm(`定期チェック（heartbeat）です。ユーザーからの指示はありません。
+あなたが自分で台帳と予定を点検します。
+
+次の順に見て、最初に該当したものだけを 1 通の reply にまとめ、対象タスクに show_task を添えてください。
+
+1. 期限を過ぎているのに未完了のタスク（最優先。何日/何時間過ぎているかを言う）
+2. 期限が 24 時間以内に来るタスク（残り時間を言う）
+3. waiting_user のまま 24 時間以上動いていないタスク（承認が止まっている）
+4. open のまま 24 時間以上 updated_at が動いていないタスク（着手されていない）
+5. 12 時間以内に始まる予定に**関連する未完了タスクがある**場合、そのタスクを促す
+   （予定は「なぜ今か」の理由として述べる。関連タスクが無いなら該当しない）
+
+該当が複数あっても、上から 1 つだけを選ぶ。全部並べると結局読まれない。
+1〜5 のどれにも当てはまらなければ actions は空配列にする。
+
+# 発言の中身（ここが本題）
+選んだ候補について、**ユーザーが次に取れる行動**を 1 つ書けないなら、その候補は飛ばして次を見る。
+コンテキストに書いてあることをそのまま読み上げるのは発信ではない。
+
+悪い例（どれも発信する価値がない）
+- 「10:00 に役員会の予定があります」→ カレンダーを見れば分かる。何をすべきかが無い
+- 「未完了のタスクが 3 件あります」→ 台帳を見れば分かる。どれを今やるのかが無い
+- 「予定が近づいています。ご確認ください」→ 中身が無い
+
+良い例
+- 「請求書を送る の期限は昨日 18:00 でした。まだ未完了です」＋ show_task
+- 「健康診断の予約 が 2 日間承認待ちのままです。進めますか？」＋ show_task
+- 「10:00 の役員会の前に 資料をまとめる が残っています。あと 50 分です」＋ show_task
+
+カレンダーは「タスクを促す理由」として使い、予定そのものの通知には使わない。
+
+# この経路での制約
+- create_task と create_event は使わない（heartbeat は声かけだけを行う）
+- 「直近の声かけ」に同じ task_id が 4 時間以内にあれば、そのタスクは飛ばして次の候補を見る
+  （期限を過ぎているものは例外）
+- 台帳に未完了タスクが 1 件も無いなら、何も言わない（actions は空配列）。
+  先回りの材料は台帳であり、賑やかしのために予定を読み上げてはならない
 
 # 自律レベル
 ${this.state.autonomyLevel}`);
