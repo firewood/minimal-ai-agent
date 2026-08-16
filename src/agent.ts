@@ -197,7 +197,7 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
    * LLM は自分が呼ばれた日付を知らないので、これが無いと「期限が近い」も
    * 「3 日放置」も判断できない。プロンプトで催促しても材料が無ければ動けない。
    */
-  private localNow(): { iso: string; local: string; hour: number; weekday: number } {
+  private localNow(): { iso: string; local: string; hour: number } {
     const now = new Date();
     const parts = new Intl.DateTimeFormat("ja-JP", {
       timeZone: this.state.timezone,
@@ -212,25 +212,27 @@ export class PersonalAssistantAgent extends Agent<Env, AssistantState> {
       hourCycle: "h23",
     }).formatToParts(now);
     const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
-    // 0=日曜。Intl は曜日を文字で返すので、並びから番号に戻す。
-    const weekday = ["日", "月", "火", "水", "木", "金", "土"].indexOf(get("weekday"));
     return {
       iso: now.toISOString(),
+      // 曜日は LLM に渡す表示にだけ使う（「金曜の 18 時」で判断できることがある）。
       local: `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}（${get("weekday")}）`,
       hour: Number(get("hour")),
-      weekday,
     };
   }
 
   /**
-   * 自発的な発信を控える時間帯（22:00〜07:00 と土日）。
+   * 自発的な発信を控える時間帯（22:00〜07:00）。
    *
    * 「夜中に通知するな」は時刻から機械的に決まる。LLM に判断させる理由がない
    * （CONCEPT.md 原則 2「LLM は頭脳、コードは手足」）。
+   *
+   * 当初は土日も丸ごと静音にしていたが、外した。個人の雑務はむしろ週末に片づくもので、
+   * 土日を黙らせると「先回りするアシスタント」が週の 2/7 で完全に止まる。
+   * 静かにしたい対象は曜日ではなく時間帯だった。
    */
   private isQuietHours(): boolean {
-    const { hour, weekday } = this.localNow();
-    return hour >= 22 || hour < 7 || weekday === 0 || weekday === 6;
+    const { hour } = this.localNow();
+    return hour >= 22 || hour < 7;
   }
 
   // ---- フロー B: heartbeat（自律ループ） ----

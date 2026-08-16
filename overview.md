@@ -271,7 +271,7 @@ Gemini の `responseSchema` が OpenAPI サブセットで `oneOf` を持たな�
 （`task_events` の `nudged`。`tasks.updated_at` は台帳の変更でしか動かないので、
 催促した事実はここに残す）。タスク側も `created_at` / `updated_at` を渡すようにしてある。
 
-静音は LLM に判断させない。`isQuietHours()`（22:00〜07:00 と土日）が真で期限超過タスクが
+静音は LLM に判断させない。`isQuietHours()`（22:00〜07:00）が真で期限超過タスクが
 無ければ、`heartbeat()` は LLM を呼ばずに `heartbeat.quiet` を残して終わる。時刻から機械的に
 決まることをプロンプトに委ねる理由がなく、API も消費しない。
 
